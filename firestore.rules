@@ -1,0 +1,157 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // The only IDs the in-app demo tool may create or remove.  Keeping this
+    // list fixed prevents a signed-in user from using the demo button to write
+    // arbitrary profiles.
+    function isDemoProfileId(userId) {
+      return userId in [
+        'demo_priya_s',
+        'demo_rahul_k',
+        'demo_ananya_m',
+        'demo_vikram_p',
+        'demo_sneha_t'
+      ];
+    }
+
+    function exchangeData(exchangeId) {
+      return get(/databases/$(database)/documents/exchangeRequests/$(exchangeId)).data;
+    }
+
+    function isExchangeParticipant(exchangeId) {
+      return isAuthenticated()
+        && (exchangeData(exchangeId).senderId == request.auth.uid
+          || exchangeData(exchangeId).receiverId == request.auth.uid);
+    }
+
+    // ----------------------------------------------------------
+    // 1. Users Collection
+    // ----------------------------------------------------------
+    match /users/{userId} {
+      // Any authenticated user (or demo viewer) can read public student profiles
+      allow read: if isAuthenticated() || resource.data.isDemo == true;
+
+      // New accounts start with system-managed reputation fields. Signed-in
+      // users may also create the five fixed records used by the demo seeder.
+      allow create: if (isOwner(userId)
+                      && request.resource.data.isDemo == false
+                      && request.resource.data.averageRating == 5.0
+                      && request.resource.data.reviewCount == 0
+                      && request.resource.data.completedExchanges == 0)
+                    || (isAuthenticated()
+                        && isDemoProfileId(userId)
+                        && request.resource.data.isDemo == true);
+      
+      // Profile owners can edit their profile, but cannot alter reputation or
+      // convert their profile into demo data from the client.
+      allow update: if isOwner(userId)
+                    && request.resource.data.averageRating == resource.data.averageRating
+                    && request.resource.data.reviewCount == resource.data.reviewCount
+                    && request.resource.data.completedExchanges == resource.data.completedExchanges
+                    && request.resource.data.isDemo == resource.data.isDemo;
+
+      // Demo data is removable through the in-app development tool only.
+      allow delete: if isOwner(userId)
+                    || (isAuthenticated()
+                        && isDemoProfileId(userId)
+                        && resource.data.isDemo == true);
+    }
+
+    // ----------------------------------------------------------
+    // 2. Exchange Requests Collection
+    // ----------------------------------------------------------
+    match /exchangeRequests/{requestId} {
+      // Only sender or receiver can read the request
+      allow read: if isAuthenticated() && 
+        (resource.data.senderId == request.auth.uid || resource.data.receiverId == request.auth.uid);
+
+      // Only authenticated users can create a request with themselves as the sender
+      allow create: if isAuthenticated() && request.resource.data.senderId == request.auth.uid;
+
+      // Only the receiver can accept/reject a pending request; either
+      // participant can complete an accepted request. No other fields change.
+      allow update: if isAuthenticated() && 
+        (resource.data.senderId == request.auth.uid || resource.data.receiverId == request.auth.uid) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']) &&
+        ((resource.data.status == 'pending' &&
+          request.auth.uid == resource.data.receiverId &&
+          (request.resource.data.status == 'accepted' || request.resource.data.status == 'rejected')) ||
+         (resource.data.status == 'accepted' && request.resource.data.status == 'completed'));
+
+      allow delete: if isAuthenticated() && resource.data.senderId == request.auth.uid;
+    }
+
+    // ----------------------------------------------------------
+    // 3. Conversations & Messages
+    // ----------------------------------------------------------
+    match /conversations/{conversationId} {
+      // Must be a participant to read or modify the conversation
+      allow read, update: if isAuthenticated() && 
+        request.auth.uid in resource.data.participantIds;
+
+      allow create: if isAuthenticated() && 
+        request.auth.uid in request.resource.data.participantIds;
+
+      match /messages/{messageId} {
+        // Only conversation participants can read messages
+        allow read: if isAuthenticated() && 
+          request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds;
+
+        // Can only send message as oneself and if in the conversation
+        allow create: if isAuthenticated() && 
+          request.resource.data.senderId == request.auth.uid &&
+          request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds;
+
+        allow update, delete: if false; // Messages are immutable
+      }
+    }
+
+    // ----------------------------------------------------------
+    // 4. Reviews Collection
+    // ----------------------------------------------------------
+    match /reviews/{reviewId} {
+      // Anyone authenticated can read reviews
+      allow read: if isAuthenticated();
+
+      // Reviews are immutable and must be written once by a participant after
+      // the linked exchange is complete. The deterministic ID prevents a
+      // reviewer from submitting a second review for the same exchange.
+      allow create: if isExchangeParticipant(request.resource.data.exchangeRequestId) &&
+        reviewId == request.resource.data.exchangeRequestId + '_' + request.auth.uid &&
+        request.resource.data.reviewerId == request.auth.uid &&
+        request.resource.data.revieweeId != request.auth.uid &&
+        (request.resource.data.revieweeId == exchangeData(request.resource.data.exchangeRequestId).senderId ||
+         request.resource.data.revieweeId == exchangeData(request.resource.data.exchangeRequestId).receiverId) &&
+        exchangeData(request.resource.data.exchangeRequestId).status == 'completed' &&
+        request.resource.data.rating is number &&
+        request.resource.data.rating >= 1.0 && 
+        request.resource.data.rating <= 5.0;
+
+      allow update, delete: if false;
+    }
+
+    // ----------------------------------------------------------
+    // 5. Notifications Collection
+    // ----------------------------------------------------------
+    match /notifications/{notificationId} {
+      // Only recipient can read or mark read
+      allow read, update: if isAuthenticated() && resource.data.recipientId == request.auth.uid;
+
+      // Authenticated users can create notifications for peers (e.g. on new request or message)
+      allow create: if isAuthenticated();
+
+      allow delete: if isAuthenticated() && resource.data.recipientId == request.auth.uid;
+    }
+  }
+}
